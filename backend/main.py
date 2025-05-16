@@ -65,3 +65,7 @@ async def chat(req: QueryRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+# Search ingestion all work together—without any OpenAI quota issues. 
+# When you’re ready to re-enable the real RAG calls, you can swap back 
+# in your previous embedding/chat code.
