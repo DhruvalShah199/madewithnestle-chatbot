@@ -1,23 +1,48 @@
 # backend/main.py
 
 import os
-import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+
+from sentence_transformers import SentenceTransformer
 from graph_query import query_graph
 
-# ── 0) LOAD SCRAPED CONTENT ─────────────────────────────────────────────────
-HERE = os.path.dirname(__file__)
-with open(os.path.join(HERE, "content.json"), encoding="utf-8") as f:
-    ALL_DOCS = json.load(f)  # list of {"url", "title", "text"}
+# If/when you re-enable the real OpenAI chat, uncomment:
+# from openai import OpenAI
 
-# ── 1) FASTAPI SETUP ─────────────────────────────────────────────────────────
-app = FastAPI(title="MadeWithNestlé Chatbot (Stubbed)")
+# ── 0) LOAD ENVIRONMENT ──────────────────────────────────────────────────────
+AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
+AZURE_SEARCH_KEY      = os.getenv("AZURE_SEARCH_KEY")
+SEARCH_INDEX_NAME     = "nestle-content"
 
+if not (AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY):
+    raise RuntimeError(
+        "Missing AZURE_SEARCH_ENDPOINT or AZURE_SEARCH_KEY env var"
+    )
+
+# ── 1) INITIALIZE CLIENTS & MODELS ───────────────────────────────────────────
+# 1a) Azure Cognitive Search client (vector retrieval)
+search_client = SearchClient(
+    endpoint=AZURE_SEARCH_ENDPOINT,
+    index_name=SEARCH_INDEX_NAME,
+    credential=AzureKeyCredential(AZURE_SEARCH_KEY)
+)
+
+# 1b) SBERT model for local embeddings
+sbert = SentenceTransformer("all-MiniLM-L6-v2")
+
+# When ready to use OpenAI embeddings & chat, uncomment and configure:
+# openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ── 2) FASTAPI SETUP ──────────────────────────────────────────────────────────
+app = FastAPI(title="MadeWithNestlé Chatbot")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only
+    allow_origins=["*"],  # tighten this in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,31 +54,73 @@ class ChatResponse(BaseModel):
     answer: str
     references: list[str]
 
-# ── 2) /chat ENDPOINT ─────────────────────────────────────────────────────────
+# ── 3) /chat ENDPOINT ─────────────────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: QueryRequest):
     try:
-        # 2a) Fake vector hits = first 3 scraped pages
-        vector_hits = ALL_DOCS[:3]
-        
-        # 2b) Real graph hits from Neo4j
+        # ----- VECTOR EMBEDDING -----
+        # Real OpenAI embedding (commented out until you re-enable):
+        # emb = openai_client.embeddings.create(
+        #     model="text-embedding-ada-002",
+        #     input=req.question
+        # )["data"][0]["embedding"]
+        # q_vec = emb
+
+        # Free-mode SBERT embedding (currently unused in fallback):
+        q_vec = sbert.encode(req.question, show_progress_bar=False).tolist()
+
+        # ----- VECTOR RETRIEVAL -----
+        # REMOVED: vector_search call (not available in this SDK version)
+        # vs = search_client.vector_search(
+        #     vector=q_vec,
+        #     top=3,
+        #     fields="url,title,text"
+        # ).results
+        # vector_docs = [r.document for r in vs]
+
+        # ADDED: fallback full-text search until vector_search() exists
+        results = search_client.search(
+            search_text=req.question,
+            top=3,
+            select=["url", "title", "text"]
+        )
+        vector_docs = [
+            {"url": r["url"], "title": r["title"], "text": r["text"]}
+            for r in results
+        ]
+
+        # ----- GRAPH RETRIEVAL -----
         graph_hits = query_graph(req.question, limit=3)
 
-        # 2c) Build a stubbed answer
-        vect_list = "\n".join(f"- {d['url']}" for d in vector_hits)
-        graph_list = "\n".join(f"- {h['url']}" for h in graph_hits)
+        # ----- CHAT COMPLETION -----
+        # Real OpenAI chat (commented out until re-enabled):
+        # prompt = (
+        #     f"User: {req.question}\n\n"
+        #     "Vector context:\n" + 
+        #     "\n".join(f"- {d['url']}: {d['text'][:200]}…" for d in vector_docs) +
+        #     "\n\nGraph context:\n" +
+        #     "\n".join(f"- {h['url']}: {h['snippet']}…" for h in graph_hits)
+        # )
+        # chat_resp = openai_client.chat.completions.create(
+        #     model="gpt-4o-mini",
+        #     messages=[{"role":"user","content":prompt}]
+        # )
+        # answer = chat_resp.choices[0].message.content.strip()
 
+        # Stubbed answer for free mode:
+        vect_list = "\n".join(f"- {d['url']}" for d in vector_docs)
+        graph_list = "\n".join(f"- {h['url']}" for h in graph_hits)
         answer = (
-            "📄 **Vector search results** (top 3):\n"
+            "**Vector search results** (top 3):\n"
             f"{vect_list}\n\n"
-            "🔗 **Graph search results** (top 3):\n"
+            "**Graph search results** (top 3):\n"
             f"{graph_list}"
         )
 
-        # 2d) Collect unique references
+        # ----- REFERENCES -----
         refs = list({
-            * (d["url"] for d in vector_hits),
-            * (h["url"] for h in graph_hits),
+            *[d["url"] for d in vector_docs],
+            *[h["url"] for h in graph_hits],
         })
 
         return ChatResponse(answer=answer, references=refs)
@@ -61,11 +128,8 @@ async def chat(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── 3) HEALTHCHECK ───────────────────────────────────────────────────────────
+
+# ── 4) HEALTHCHECK ───────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-# Search ingestion all work together—without any OpenAI quota issues. 
-# When you’re ready to re-enable the real RAG calls, you can swap back 
-# in your previous embedding/chat code.
